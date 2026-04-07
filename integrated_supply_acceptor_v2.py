@@ -46,10 +46,7 @@ sys.stdout.reconfigure(line_buffering=True)
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR   = os.path.dirname(SCRIPT_DIR)
 FORECAST_DIR = os.path.join(PARENT_DIR, 'updated_forecast', 'production_v5')
-OUTPUT_DIR   = os.path.join(SCRIPT_DIR, 'outputs')
 UK_TZ        = ZoneInfo('Europe/London')
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -201,9 +198,9 @@ def run_actuals_v2(dates: list) -> str | None:
     import supply_acceptor_v2 as sav2
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    demand_file = os.path.join(OUTPUT_DIR, f'demand_v2_{stamp}.csv')
-    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
+    demand_file = os.path.join(SCRIPT_DIR, f'demand_v2_{stamp}.csv')
+    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
 
     print("\nConnecting to Snowflake (browser auth)...")
     conn = fv2.get_conn()
@@ -262,8 +259,8 @@ def run_forecast_v2(dates: list) -> str:
             sys.exit(1)
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
+    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
 
     # Fetch reservations
     print("\nConnecting to Snowflake (browser auth)...")
@@ -420,7 +417,7 @@ def write_recommendations_csv(output_path: str):
     out = recs[out_cols]
 
     for pickup_date, group in out.groupby(out['DATE'].dt.date):
-        csv_path = os.path.join(OUTPUT_DIR, f'recommended_tps_{pickup_date}.csv')
+        csv_path = os.path.join(SCRIPT_DIR, f'recommended_tps_{pickup_date}.csv')
         group.to_csv(csv_path, index=False)
         print(f"[recommendations-v2] Written {len(group)} row(s)  →  {csv_path}")
 
@@ -769,8 +766,10 @@ def write_vetted_recommendations_csv(output_path: str):
     recs = recs.sort_values(['DATE', 'sourcezone', 'new_recommendation_rank'])
     out_cols = [c for c in OUT_COLS if c in recs.columns]
 
+    script_dir = __import__('os').path.dirname(__import__('os').path.abspath(output_path))
+
     for pickup_date, group in recs.groupby(recs['DATE'].dt.date):
-        csv_path = os.path.join(OUTPUT_DIR, f'vetted_tps_{pickup_date}.csv')
+        csv_path = __import__('os').path.join(script_dir, f'vetted_tps_{pickup_date}.csv')
         group[out_cols].to_csv(csv_path, index=False)
 
         n_accept  = int((group['vetting_status'] == 'ACCEPT').sum())
@@ -785,6 +784,300 @@ def write_vetted_recommendations_csv(output_path: str):
         )
 
     recs.drop(columns=['_score', '_is_new_tp', 'deallo_pct'], inplace=True, errors='ignore')
+
+
+# ── Vetted report printer ──────────────────────────────────────────────────────
+
+def print_vetted_report(output_path: str, is_forecast: bool = False):
+    """
+    Prints the full vetted recommendations report after write_vetted_recommendations_csv().
+    Sections:
+      1. Vetted TP list grouped by zone
+      2. Flags (rule-based)
+      3. Vetting Summary table
+    """
+    import os
+    import pandas as pd
+
+    try:
+        from tabulate import tabulate as _tab
+        _HAS_TAB = True
+    except ImportError:
+        _HAS_TAB = False
+
+    def _tabulate(rows, headers):
+        if _HAS_TAB:
+            return _tab(rows, headers=headers, tablefmt='simple')
+        col_w = [max(len(str(h)), max((len(str(r[i])) for r in rows), default=0))
+                 for i, h in enumerate(headers)]
+        sep = '  '.join('-' * w for w in col_w)
+        hdr = '  '.join(str(h).ljust(w) for h, w in zip(headers, col_w))
+        body = '\n'.join('  '.join(str(r[i]).ljust(w) for i, w in enumerate(col_w)) for r in rows)
+        return f"{hdr}\n{sep}\n{body}"
+
+    script_dir = os.path.dirname(os.path.abspath(output_path))
+    summary_path = output_path.replace('.csv', '_zone_summary.csv')
+    if not os.path.exists(summary_path):
+        return
+
+    zone_summary = pd.read_csv(summary_path)
+    zone_summary['_zk'] = (zone_summary['Zone']
+                           .str.replace(r'\s*\[.*?\]', '', regex=True)
+                           .str.replace('⚠', '', regex=False)
+                           .str.strip().str.lower())
+
+    def _zval(zrow, col, default=0):
+        return zrow[col].iloc[0] if col in zrow.columns and len(zrow) else default
+
+    for pickup_date_str in sorted(zone_summary['Pickup Date'].astype(str).str[:10].unique()):
+        vetted_path = os.path.join(script_dir, f'vetted_tps_{pickup_date_str}.csv')
+        if not os.path.exists(vetted_path):
+            continue
+
+        vetted = pd.read_csv(vetted_path)
+        vetted['sourcezone'] = vetted['sourcezone'].str.strip().str.lower()
+        vetted['USERNAME']   = vetted['USERNAME'].str.strip()
+        vetted['deallo_pct'] = pd.to_numeric(vetted['deallo_pct'], errors='coerce').fillna(0.0)
+        vetted['rating']     = pd.to_numeric(vetted['rating'],     errors='coerce').fillna(0.0)
+        day_summary = zone_summary[zone_summary['Pickup Date'].astype(str).str[:10] == pickup_date_str]
+
+        W = 94
+        print('\n' + '=' * W)
+        print(f"  VETTED RECOMMENDATIONS — {pickup_date_str}")
+        print('=' * W)
+
+        # ── Section 1: Per-zone TP tables ──────────────────────────────────────
+        all_zones = sorted(vetted['sourcezone'].unique())
+        for zone in all_zones:
+            zv = vetted[vetted['sourcezone'] == zone].sort_values('new_recommendation_rank')
+            n_acc  = int((zv['vetting_status'] == 'ACCEPT').sum())
+            n_hold = int((zv['vetting_status'] == 'HOLD_EI').sum())
+            n_dup  = int(zv['vetting_status'].isin(['REPLACE_DEDUP', 'REMOVE_DEDUP']).sum())
+            parts = []
+            if n_acc:  parts.append(f"{n_acc} ACCEPT")
+            if n_hold: parts.append(f"{n_hold} HOLD_EI")
+            if n_dup:  parts.append(f"{n_dup} DEDUP")
+            zs = day_summary[day_summary['_zk'] == zone]
+            gap   = int(_zval(zs, 'Gap'))
+            unf   = int(_zval(zs, 'Unfilled Gap'))
+            hdr_extra = f"  Gap={gap}" if gap else ""
+            if unf: hdr_extra += f"  ⚠ Unfill={unf}"
+            print(f"\n  {zone.upper()}  ({', '.join(parts)}){hdr_extra}")
+
+            rows = []
+            for _, r in zv.iterrows():
+                men  = int(r['NUMBER_OF_MEN'])
+                rt   = str(r.get('RES_TYPE', '')).strip().lower()
+                cons = str(r.get('consider_res_type', '')).strip().lower()
+                if men == 12:    tp_type = '12M'
+                elif rt == 'custom': tp_type = 'Cus'
+                elif rt == 'national': tp_type = 'Nat'
+                else:            tp_type = 'Loc'
+                vat  = 'Yes' if int(r.get('VAT_STATUS', 0) or 0) else 'No'
+                stat = r['vetting_status']
+                flags = ''
+                if stat == 'ACCEPT':
+                    if r['deallo_pct'] > 20: flags += ' ⚠ high deallo'
+                    if 4.4 <= r['rating'] <= 4.5: flags += ' ⚠ low rating'
+                reason = str(r.get('vetting_reason', '') or '').strip()
+                # Shorten reason for display
+                if 'EI reservation' in reason:
+                    reason_short = f"quota hold"
+                elif 'EI balancing' in reason:
+                    reason_short = f"EI balancing hold"
+                elif 'Dedup' in reason or 'DEDUP' in stat:
+                    reason_short = reason[:60] if reason else stat
+                else:
+                    reason_short = ''
+                rows.append([
+                    int(r['ID']),
+                    r['USERNAME'],
+                    f"{men}M",
+                    tp_type,
+                    f"{r['rating']:.2f}",
+                    f"{r['deallo_pct']:.1f}%",
+                    vat,
+                    stat + flags,
+                    reason_short,
+                ])
+            print(_tabulate(rows, ['ID', 'Username', 'Men', 'Type', 'Rating', 'Deallo', 'VAT', 'Status', 'Note']))
+
+        # ── Section 2: Flags ───────────────────────────────────────────────────
+        flags_list = []
+        flag_n = 1
+
+        # F1: Unfilled slots
+        unf_zones = day_summary[day_summary['Unfilled Gap'] > 0]
+        for _, row in unf_zones.iterrows():
+            zname = row['_zk']
+            unf   = int(row['Unfilled Gap'])
+            pend  = int(row['Pending'])
+            g1m   = int(row['Gap1M'])
+            g2m   = int(row['Gap2M'])
+            bucket_str = []
+            if g1m: bucket_str.append(f"G1M={g1m}")
+            if g2m: bucket_str.append(f"G2M={g2m}")
+            bkt = f" ({', '.join(bucket_str)})" if bucket_str else ''
+            pool_note = f"Pend={pend} TP{'s' if pend != 1 else ''}" if pend > 0 else "pool empty"
+            flags_list.append(
+                (flag_n, f"Unfilled — {zname}: Unfill={unf}{bkt}, {pool_note}")
+            )
+            flag_n += 1
+
+        # F2: London 1M shortfall
+        lon_s = day_summary[day_summary['_zk'] == 'london']
+        if not lon_s.empty:
+            lon = lon_s.iloc[0]
+            tgt1m  = int(lon['Tgt1M'])
+            a1m    = int(lon['Acc1M'])
+            a12to1 = int(lon['Acc12M_to_1M'])
+            lon_v  = vetted[(vetted['sourcezone'] == 'london') & (vetted['vetting_status'] == 'ACCEPT')]
+            new_1m = int(lon_v[lon_v['NUMBER_OF_MEN'].isin([1, 12])].shape[0])
+            eff_1m = a1m + a12to1 + new_1m
+            if eff_1m < tgt1m:
+                flags_list.append((flag_n, f"London 1M shortfall — Tgt1M={tgt1m}, effective coverage={eff_1m} (A1M={a1m} + Acc12M→1M={a12to1} + new accepted={new_1m})"))
+                flag_n += 1
+
+        # F3: High deallo (>20%) in ACCEPT recs
+        hi_d = vetted[(vetted['vetting_status'] == 'ACCEPT') & (vetted['deallo_pct'] > 20)]
+        if not hi_d.empty:
+            lines = [f"{r['USERNAME']} ({r['sourcezone']}, {r['deallo_pct']:.1f}%)" for _, r in hi_d.iterrows()]
+            flags_list.append((flag_n, f"High deallo in ACCEPT recs (>20%): {', '.join(lines)}"))
+            flag_n += 1
+
+        # F4: Low rating (4.4-4.5) in ACCEPT recs
+        lo_r = vetted[(vetted['vetting_status'] == 'ACCEPT') & (vetted['rating'].between(4.4, 4.51))]
+        if not lo_r.empty:
+            lines = [f"{r['USERNAME']} ({r['sourcezone']}, {r['rating']:.2f})" for _, r in lo_r.iterrows()]
+            flags_list.append((flag_n, f"Low rating in ACCEPT recs (4.4–4.5): {', '.join(lines)}"))
+            flag_n += 1
+
+        # F5: Zones where all new recs were held (0 net accepted)
+        quota_zones = set(EI_RESERVATION_QUOTA.keys())
+        for zone in all_zones:
+            zv = vetted[vetted['sourcezone'] == zone]
+            zs = day_summary[day_summary['_zk'] == zone]
+            new_acc  = int(_zval(zs, 'Newly Accepted'))
+            n_accept = int((zv['vetting_status'] == 'ACCEPT').sum())
+            n_hold   = int((zv['vetting_status'] == 'HOLD_EI').sum())
+            gap      = int(_zval(zs, 'Gap'))
+            pend     = int(_zval(zs, 'Pending'))
+            if new_acc > 0 and n_accept == 0 and n_hold > 0 and gap > 0:
+                reason = "EI quota" if zone in quota_zones else "EI balancing"
+                flags_list.append((flag_n, f"{zone}: 0 net accepted — all {n_hold} new rec{'s' if n_hold != 1 else ''} held ({reason}); Gap={gap}, Pend={pend}"))
+                flag_n += 1
+
+        # F6: Dry pool zones with gap (0 pending, Gap > 0) — no new recs flagged above
+        dry = day_summary[(day_summary['Pending'] == 0) & (day_summary['Gap'] > 0)]
+        for _, row in dry.iterrows():
+            zname = row['_zk']
+            gap   = int(row['Gap'])
+            g1m   = int(row['Gap1M'])
+            g2m   = int(row['Gap2M'])
+            # Only flag if not already covered by unfill flag
+            if int(row['Unfilled Gap']) == 0:
+                bkt = f" (G1M={g1m}, G2M={g2m})" if g1m or g2m else ''
+                flags_list.append((flag_n, f"{zname}: Gap={gap}{bkt} but 0 TPs pending — EI must cover entirely"))
+                flag_n += 1
+
+        # F7: EI quota slip-through (ACCEPT TP has worse deallo than a HOLD_EI TP in same zone)
+        for zone in all_zones:
+            zv = vetted[vetted['sourcezone'] == zone]
+            acc_tps  = zv[zv['vetting_status'] == 'ACCEPT']
+            hold_tps = zv[zv['vetting_status'] == 'HOLD_EI']
+            if acc_tps.empty or hold_tps.empty:
+                continue
+            worst_acc  = acc_tps.loc[acc_tps['deallo_pct'].idxmax()]
+            best_hold  = hold_tps.loc[hold_tps['deallo_pct'].idxmin()]
+            if worst_acc['deallo_pct'] > best_hold['deallo_pct'] and worst_acc['deallo_pct'] > 15:
+                flags_list.append((flag_n,
+                    f"{zone} EI slip-through: {worst_acc['USERNAME']} accepted ({worst_acc['deallo_pct']:.1f}% deallo) "
+                    f"while {best_hold['USERNAME']} held ({best_hold['deallo_pct']:.1f}% deallo) — "
+                    f"consider swapping"
+                ))
+                flag_n += 1
+
+        # F8: Manchester / persistent UZUU2018-type double-accepted TPs (flagged by dedup report, echo here)
+        for zone in all_zones:
+            zv = vetted[vetted['sourcezone'] == zone]
+            # If any HOLD_EI reason mentions 'already accepted' it was caught by dedup; just note it
+            dup_held = zv[zv['vetting_reason'].str.contains('already accepted', na=False, case=False) & (zv['vetting_status'] == 'HOLD_EI')]
+            if not dup_held.empty:
+                for _, r in dup_held.iterrows():
+                    flags_list.append((flag_n, f"{zone}: {r['USERNAME']} has multiple accepted reservations — ops awareness only"))
+                    flag_n += 1
+
+        print('\n' + '-' * W)
+        print('  FLAGS')
+        print('-' * W)
+        if flags_list:
+            for n, msg in flags_list:
+                print(f"  {n}. {msg}")
+        else:
+            print('  No flags — all zones healthy.')
+
+        # ── Section 3: Vetting Summary ─────────────────────────────────────────
+        summary_rows = []
+        for zone in sorted(day_summary['_zk'].unique()):
+            zs   = day_summary[day_summary['_zk'] == zone]
+            zv   = vetted[vetted['sourcezone'] == zone]
+            gap  = int(_zval(zs, 'Gap'))
+            unf  = int(_zval(zs, 'Unfilled Gap'))
+            pend = int(_zval(zs, 'Pending'))
+            new_acc_algo = int(_zval(zs, 'Newly Accepted'))
+            n_acc  = int((zv['vetting_status'] == 'ACCEPT').sum())
+            n_hold = int((zv['vetting_status'] == 'HOLD_EI').sum())
+            g1m  = int(_zval(zs, 'Gap1M'))
+            g2m  = int(_zval(zs, 'Gap2M'))
+
+            concern = ''
+            action  = ''
+
+            if unf > 0 and pend == 0:
+                concern = f"Unfill={unf} — pool empty"
+                action  = "EI must cover — flag ops"
+            elif unf > 0 and pend > 0:
+                concern = f"Unfill={unf}, {pend} TPs pending"
+                action  = "EI fallback; check at D-2"
+            elif new_acc_algo > 0 and n_acc == 0 and n_hold > 0 and gap > 0:
+                quota_zones = set(EI_RESERVATION_QUOTA.keys())
+                reason = "quota" if zone in quota_zones else "EI balancing"
+                concern = f"0 net accepted — {n_hold} held ({reason})"
+                action  = f"Deep pool ({pend} pend) — revisit D-2" if pend >= 3 else f"EI covers; monitor"
+            elif gap > 0 and pend == 0:
+                g_str = []
+                if g1m: g_str.append(f"G1M={g1m}")
+                if g2m: g_str.append(f"G2M={g2m}")
+                concern = f"Gap={gap} ({', '.join(g_str)}) — dry pool"
+                action  = "EI covers"
+            elif gap > 0 and n_acc > 0:
+                concern = f"Partially filled — Gap={gap} remains"
+                action  = "EI covers remainder"
+            else:
+                # Check for quality flags
+                hi_d_z = zv[(zv['vetting_status'] == 'ACCEPT') & (zv['deallo_pct'] > 20)]
+                if not hi_d_z.empty:
+                    worst = hi_d_z.loc[hi_d_z['deallo_pct'].idxmax()]
+                    concern = f"{worst['USERNAME']} accepted ({worst['deallo_pct']:.0f}% deallo)"
+                    action  = "Consider manual swap"
+                elif n_acc > 0 and gap == 0:
+                    concern = "Covered"
+                    action  = "No action"
+
+            if concern:
+                summary_rows.append([zone, concern, action])
+
+        print('\n' + '-' * W)
+        print('  VETTING SUMMARY')
+        print('-' * W)
+        if summary_rows:
+            # indent each row of tabulate output
+            tbl = _tabulate(summary_rows, ['Zone', 'Concern', 'Action'])
+            for line in tbl.splitlines():
+                print('  ' + line)
+        else:
+            print('  All zones covered — no concerns.')
+        print()
 
 
 # ── Shared output loader ───────────────────────────────────────────────────────
@@ -845,6 +1138,7 @@ def main():
             report_tp_duplicates(output_path)
             write_recommendations_csv(output_path)
             write_vetted_recommendations_csv(output_path)
+            print_vetted_report(output_path, is_forecast=False)
 
     for d_str in forecast_dates:
         print(f"[integrated-v2] → FORECAST run for: {d_str}")
@@ -852,6 +1146,7 @@ def main():
         report_tp_duplicates(output_path)
         write_recommendations_csv(output_path)
         write_vetted_recommendations_csv(output_path)
+        print_vetted_report(output_path, is_forecast=True)
 
 
 if __name__ == '__main__':
