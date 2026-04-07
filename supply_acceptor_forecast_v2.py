@@ -32,6 +32,8 @@ import pandas as pd
 SCRIPT_DIR           = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR           = os.path.dirname(SCRIPT_DIR)
 DEFAULT_FORECAST_DIR = os.path.join(PARENT_DIR, 'updated_forecast', 'production_v5')
+OUTPUT_DIR           = os.path.join(SCRIPT_DIR, 'outputs')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -164,11 +166,11 @@ def run(forecast_dir: str, res_path: str,
     print(f"  Demand    : {furn_total} furniture + {rem_total} removals | dates: {[str(d)[:10] for d in dates_seen]}")
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    demand_tmp  = os.path.join(SCRIPT_DIR, f'demand_v2_forecast_{stamp}.csv')
+    demand_tmp  = os.path.join(OUTPUT_DIR, f'demand_v2_forecast_{stamp}.csv')
     demand.to_csv(demand_tmp, index=False)
 
     if output_path is None:
-        output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
+        output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
 
     sav2.run(demand_tmp, res_path, output_path, use_effective_targets=True)
     return output_path

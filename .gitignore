@@ -1,6 +1,7 @@
 # Output files (generated on each run — do not commit)
 outputs/
 demand_v2_*.csv
+demand_v2_forecast_*.csv
 recommended_reservations_*.csv
 recommended_tps_*.csv
 vetted_tps_*.csv
