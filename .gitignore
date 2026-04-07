@@ -1,0 +1,35 @@
+# Output files (generated on each run — do not commit)
+demand_v2_*.csv
+recommended_reservations_*.csv
+recommended_tps_*.csv
+vetted_tps_*.csv
+*_zone_summary_*.csv
+supply_acceptor_v2_output_*.csv
+supply_acceptor_v2_forecast_output_*.csv
+
+# AWS / credentials
+.env
+*.env
+credentials
+.aws/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
