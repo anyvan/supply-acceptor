@@ -46,7 +46,10 @@ sys.stdout.reconfigure(line_buffering=True)
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR   = os.path.dirname(SCRIPT_DIR)
 FORECAST_DIR = os.path.join(PARENT_DIR, 'updated_forecast', 'production_v5')
+OUTPUT_DIR   = os.path.join(SCRIPT_DIR, 'outputs')
 UK_TZ        = ZoneInfo('Europe/London')
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -198,9 +201,9 @@ def run_actuals_v2(dates: list) -> str | None:
     import supply_acceptor_v2 as sav2
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    demand_file = os.path.join(SCRIPT_DIR, f'demand_v2_{stamp}.csv')
-    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
+    demand_file = os.path.join(OUTPUT_DIR, f'demand_v2_{stamp}.csv')
+    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
 
     print("\nConnecting to Snowflake (browser auth)...")
     conn = fv2.get_conn()
@@ -259,8 +262,8 @@ def run_forecast_v2(dates: list) -> str:
             sys.exit(1)
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
+    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
 
     # Fetch reservations
     print("\nConnecting to Snowflake (browser auth)...")
@@ -417,7 +420,7 @@ def write_recommendations_csv(output_path: str):
     out = recs[out_cols]
 
     for pickup_date, group in out.groupby(out['DATE'].dt.date):
-        csv_path = os.path.join(SCRIPT_DIR, f'recommended_tps_{pickup_date}.csv')
+        csv_path = os.path.join(OUTPUT_DIR, f'recommended_tps_{pickup_date}.csv')
         group.to_csv(csv_path, index=False)
         print(f"[recommendations-v2] Written {len(group)} row(s)  →  {csv_path}")
 
@@ -766,10 +769,8 @@ def write_vetted_recommendations_csv(output_path: str):
     recs = recs.sort_values(['DATE', 'sourcezone', 'new_recommendation_rank'])
     out_cols = [c for c in OUT_COLS if c in recs.columns]
 
-    script_dir = __import__('os').path.dirname(__import__('os').path.abspath(output_path))
-
     for pickup_date, group in recs.groupby(recs['DATE'].dt.date):
-        csv_path = __import__('os').path.join(script_dir, f'vetted_tps_{pickup_date}.csv')
+        csv_path = os.path.join(OUTPUT_DIR, f'vetted_tps_{pickup_date}.csv')
         group[out_cols].to_csv(csv_path, index=False)
 
         n_accept  = int((group['vetting_status'] == 'ACCEPT').sum())
