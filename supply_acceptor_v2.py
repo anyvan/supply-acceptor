@@ -518,6 +518,7 @@ def run(demand_path: str, res_path: str, output_path: str = None,
     res.loc[pending_mask, '_score'] = res[pending_mask].apply(score_tp, axis=1)
     res['new_recommendation']      = False
     res['new_recommendation_rank'] = pd.NA
+    res['rating_fallback']         = False
 
     # ── Step 7: Zone-by-zone selection ────────────────────────────────────────
     accepted_summary = []
@@ -531,6 +532,7 @@ def run(demand_path: str, res_path: str, output_path: str = None,
 
         newly_accepted = 0
         unfilled       = 0
+        to_accept      = pd.DataFrame()   # primary-pass selections (empty until filled)
 
         # Skip if below minimum jobs threshold
         min_jobs = ZONE_MIN_JOBS.get(zone, 0)
@@ -597,6 +599,58 @@ def run(demand_path: str, res_path: str, output_path: str = None,
                     res.at[idx, 'new_recommendation_rank'] = rank
                 newly_accepted = min(egap, len(to_accept))
                 unfilled       = max(0, egap - len(to_accept))
+
+            # ── Fallback pass: use below-MIN_RATING TPs if slots remain unfilled ──
+            if unfilled > 0:
+                # Derive remaining 1M/2M gaps from what primary pass filled.
+                # 12M TPs in select_v2 go to the larger gap first.
+                men_vals = to_accept['NUMBER_OF_MEN'].apply(lambda x: float(x or 0)) if not to_accept.empty else pd.Series([], dtype=float)
+                n_1m_sel  = int((men_vals == 1.0).sum())
+                n_2m_sel  = int((men_vals == 2.0).sum())
+                n_12m_sel = int((men_vals == 12.0).sum())
+                if egap_1m >= egap_2m:
+                    true_1m_filled = min(egap_1m, n_1m_sel + n_12m_sel)
+                    true_2m_filled = min(egap_2m, n_2m_sel)
+                else:
+                    true_2m_filled = min(egap_2m, n_2m_sel + n_12m_sel)
+                    true_1m_filled = min(egap_1m, n_1m_sel)
+                rem_gap_1m = max(0, egap_1m - true_1m_filled)
+                rem_gap_2m = max(0, egap_2m - true_2m_filled)
+
+                fallback_mask = (
+                    (res['sourcezone'] == zone) &
+                    (res['DATE']       == date) &
+                    pending_mask &
+                    (res['new_recommendation'] == False) &
+                    (res['rating'].apply(lambda r: float(r or 0)) < MIN_RATING) &
+                    (res['RESERVATION_CAPACITY'].apply(lambda c: float(c or 0)) >= MIN_CAPACITY)
+                )
+                fallback_candidates = res.loc[fallback_mask].copy()
+
+                if not fallback_candidates.empty:
+                    accepted_usernames = set(
+                        res[
+                            (res['sourcezone'] == zone) &
+                            (res['DATE'] == date) &
+                            ((res['IRES_STATUS'] == 'accepted') | (res['new_recommendation'] == True))
+                        ]['USERNAME'].str.strip()
+                    )
+                    south_quota_pct = LONDON_SOUTH_QUOTA_PCT if zone == 'london' else 0.0
+                    fallback_selected = select_v2(
+                        fallback_candidates, rem_gap_1m, rem_gap_2m,
+                        accepted_usernames,
+                        float(zd.get('jobs_1m', 0)),
+                        south_quota_pct=south_quota_pct,
+                    )
+                    start_rank = len(to_accept) + 1
+                    for rank, idx in enumerate(fallback_selected.index, start=start_rank):
+                        res.at[idx, 'new_recommendation']      = True
+                        res.at[idx, 'new_recommendation_rank'] = rank
+                        res.at[idx, 'rating_fallback']         = True
+                    newly_accepted += len(fallback_selected)
+                    unfilled        = max(0, unfilled - len(fallback_selected))
+                    if not fallback_selected.empty:
+                        print(f"  [fallback] {zone} {date.date()}: {len(fallback_selected)} low-rating TP(s) accepted to fill shortfall")
 
         zone_label = zone
         if zd.get('london_mode'):
@@ -826,6 +880,8 @@ def run(demand_path: str, res_path: str, output_path: str = None,
                 flags += '  ⚠ high deallo'
             if not is_new and float(r.get('rating') or 0) < 4.5:
                 flags += f"  ⚠ rating {float(r.get('rating') or 0):.2f}"
+            if r.get('rating_fallback'):
+                flags += f"  ★ shortfall fallback (rating {float(r.get('rating') or 0):.1f})"
             print(f"  {str(r['DATE'].date()):<12} {r['sourcezone']:<22} {str(r['USERNAME']):<14} "
                   f"{str(r['NUMBER_OF_MEN']):>4} {str(r['RES_TYPE']):<10} "
                   f"{str(r.get('consider_res_type') or ''):<10} "

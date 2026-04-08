@@ -46,7 +46,10 @@ sys.stdout.reconfigure(line_buffering=True)
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR   = os.path.dirname(SCRIPT_DIR)
 FORECAST_DIR = os.path.join(PARENT_DIR, 'updated_forecast', 'production_v5')
+OUTPUT_DIR   = os.path.join(SCRIPT_DIR, 'outputs')
 UK_TZ        = ZoneInfo('Europe/London')
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -198,9 +201,9 @@ def run_actuals_v2(dates: list) -> str | None:
     import supply_acceptor_v2 as sav2
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    demand_file = os.path.join(SCRIPT_DIR, f'demand_v2_{stamp}.csv')
-    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
+    demand_file = os.path.join(OUTPUT_DIR, f'demand_v2_{stamp}.csv')
+    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_output_{stamp}.csv')
 
     print("\nConnecting to Snowflake (browser auth)...")
     conn = fv2.get_conn()
@@ -259,8 +262,8 @@ def run_forecast_v2(dates: list) -> str:
             sys.exit(1)
 
     stamp       = datetime.now().strftime('%Y-%m-%d_%H%M')
-    res_file    = os.path.join(SCRIPT_DIR, f'recommended_reservations_{stamp}.csv')
-    output_path = os.path.join(SCRIPT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
+    res_file    = os.path.join(OUTPUT_DIR, f'recommended_reservations_{stamp}.csv')
+    output_path = os.path.join(OUTPUT_DIR, f'supply_acceptor_v2_forecast_output_{stamp}.csv')
 
     # Fetch reservations
     print("\nConnecting to Snowflake (browser auth)...")
@@ -417,7 +420,7 @@ def write_recommendations_csv(output_path: str):
     out = recs[out_cols]
 
     for pickup_date, group in out.groupby(out['DATE'].dt.date):
-        csv_path = os.path.join(SCRIPT_DIR, f'recommended_tps_{pickup_date}.csv')
+        csv_path = os.path.join(OUTPUT_DIR, f'recommended_tps_{pickup_date}.csv')
         group.to_csv(csv_path, index=False)
         print(f"[recommendations-v2] Written {len(group)} row(s)  →  {csv_path}")
 
@@ -755,21 +758,162 @@ def write_vetted_recommendations_csv(output_path: str):
                             + ("Leave for EI." if ei_eligible else "Do not accept duplicate.")
                         )
 
+    # ── Layer 0.6: Post-EI-quota supply gap fallback (second pass) ───────────────
+    # EI reservation quotas (Layer 0.5) may hold back all new recs for a zone,
+    # leaving its supply gap unfilled from a pre-acceptance perspective.
+    # Run a second pass: for any EI-quota zone whose ACCEPT count is below its gap,
+    # pull additional TPs from the pending pool and mark them ACCEPT.
+    _pending_mask = (df['IRES_STATUS'] == 'pending') & (df['RES_TYPE'] != 'return')
+    _new_rows = []
+
+    for _pdate, _day_idx in recs.groupby(recs['DATE'].dt.date).groups.items():
+        _day_recs   = recs.loc[_day_idx]
+        _day_summary = zone_summary[
+            zone_summary['Pickup Date'].apply(lambda d: str(d)[:10]) == str(_pdate)
+        ]
+
+        for _zone, _qcfg in EI_RESERVATION_QUOTA.items():
+            _zone_recs = _day_recs[_day_recs['sourcezone'] == _zone]
+            _n_accept  = int((_zone_recs['vetting_status'] == 'ACCEPT').sum())
+
+            _zsum = _day_summary[_day_summary['_zone_key'] == _zone]
+            if _zsum.empty:
+                continue
+            _zrow = _zsum.iloc[0]
+            _gap  = int(_zrow.get('Gap', 0))
+            _g1m  = int(_zrow.get('Gap1M', 0))
+            _g2m  = int(_zrow.get('Gap2M', 0))
+
+            if _n_accept >= _gap or _gap == 0:
+                continue  # gap already filled by ACCEPT recs
+
+            # Compute remaining 1M/2M gaps after existing ACCEPT recs.
+            # 12M TPs: assign to the bucket with more room (same logic as main algorithm).
+            _acc    = _zone_recs[_zone_recs['vetting_status'] == 'ACCEPT']
+            _a1m    = int((_acc['NUMBER_OF_MEN'].apply(lambda m: int(m or 1)) == 1).sum())
+            _a2m    = int((_acc['NUMBER_OF_MEN'].apply(lambda m: int(m or 1)) == 2).sum())
+            _a12m_n = int((_acc['NUMBER_OF_MEN'].apply(lambda m: int(m or 1)) == 12).sum())
+            _r1m = _g1m - _a1m
+            _r2m = _g2m - _a2m
+            for _ in range(_a12m_n):
+                if _r1m > _r2m:
+                    _r1m -= 1
+                else:
+                    _r2m -= 1
+            _rem_g1m = max(0, _r1m)
+            _rem_g2m = max(0, _r2m)
+            if _rem_g1m + _rem_g2m == 0:
+                continue
+
+            # IDs already in recs for this zone-date (exclude from new candidates)
+            _rec_ids = set(recs[
+                (recs['sourcezone'] == _zone) &
+                (recs['DATE'].dt.date == _pdate)
+            ]['ID'])
+            # Usernames already accepted or recommended (for select_v2 dedup)
+            _acc_users = set(df[
+                (df['sourcezone'] == _zone) &
+                (df['DATE'].dt.date == _pdate) &
+                ((df['IRES_STATUS'] == 'accepted') | df['new_recommendation'])
+            ]['USERNAME'].str.strip())
+
+            _cand = df[
+                (df['sourcezone'] == _zone) &
+                (df['DATE'].dt.date == _pdate) &
+                _pending_mask &
+                (~df['ID'].isin(_rec_ids)) &
+                (~df['USERNAME'].str.strip().isin(_acc_users))  # hard dedup
+            ].copy()
+            if _cand.empty:
+                continue
+            _cand['_score'] = _cand.apply(sav2.score_tp, axis=1)
+
+            # Primary: rated + capacity; fallback: capacity only (low-rating)
+            _rated = _cand[
+                (_cand['rating'].apply(lambda r: float(r or 0)) >= sav2.MIN_RATING) &
+                (_cand['RESERVATION_CAPACITY'].apply(lambda c: float(c or 0)) >= sav2.MIN_CAPACITY)
+            ]
+            _is_fb = _rated.empty
+            _pool  = _cand[
+                _cand['RESERVATION_CAPACITY'].apply(lambda c: float(c or 0)) >= sav2.MIN_CAPACITY
+            ] if _is_fb else _rated
+            if _pool.empty:
+                continue
+
+            # No south quota for the fallback pass — just fill the remaining gap
+            _sel   = sav2.select_v2(
+                _pool, _rem_g1m, _rem_g2m, _acc_users,
+                float(_zrow.get('Furn1M Jobs', 0)),
+                south_quota_pct=0.0,
+            )
+            if _sel.empty:
+                continue
+
+            _next_rank = int(
+                recs[(recs['sourcezone'] == _zone) &
+                     (recs['DATE'].dt.date == _pdate)]['new_recommendation_rank'].max() or 0
+            ) + 1
+            for _off, _idx in enumerate(_sel.index):
+                _r = df.loc[_idx].to_dict()
+                _r['new_recommendation']      = True
+                _r['new_recommendation_rank'] = _next_rank + _off
+                _r['rating_fallback']         = _is_fb
+                _r['vetting_status']          = 'ACCEPT'
+                _r['vetting_reason']          = (
+                    'Post-EI-quota fallback: EI reservation quota held earlier recs; '
+                    'additional TP to fill supply gap'
+                    + (' (low-rating fallback)' if _is_fb else '')
+                )
+                _r['_score']     = float(_sel.at[_idx, '_score']) if '_score' in _sel.columns else 0.0
+                _r['_is_new_tp'] = float(_r.get('rating', 0) or 0) == 6.0
+                _r['deallo_pct'] = round(float(_r.get('Deallo Rate Overall', 0) or 0) * 100, 1)
+                _new_rows.append(_r)
+                df.at[_idx, 'new_recommendation']      = True
+                df.at[_idx, 'new_recommendation_rank'] = _next_rank + _off
+
+            print(f"  [post-EI fallback] {_zone} {_pdate}: "
+                  f"{len(_sel)} additional TP(s) ACCEPT after EI quota hold"
+                  + (' (low-rating fallback)' if _is_fb else ''))
+
+    if _new_rows:
+        recs = pd.concat([recs, pd.DataFrame(_new_rows)], ignore_index=True)
+
+    # ── Update zone summary: Unfilled Gap = gap − ACCEPT_count (post-quota) ──────
+    # The zone summary written by supply_acceptor_v2 counted all new_recs (including
+    # those later held for EI) as filling the gap. Recompute true unfilled now that
+    # we know which recs are ACCEPT vs HOLD_EI, and rewrite the summary CSV.
+    try:
+        _zs = pd.read_csv(summary_path)
+        _zs['_zk'] = (_zs['Zone']
+                      .str.extract(r'^([a-z\- ]+)', expand=False)
+                      .str.strip().str.lower())
+        for _si, _sr in _zs.iterrows():
+            _zk   = str(_sr['_zk'])
+            _pd   = str(_sr['Pickup Date'])[:10]
+            _gap_ = int(_sr.get('Gap', 0))
+            _na   = int(recs[
+                (recs['sourcezone'] == _zk) &
+                (recs['DATE'].apply(lambda d: str(d)[:10]) == _pd) &
+                (recs['vetting_status'] == 'ACCEPT')
+            ].shape[0])
+            _zs.at[_si, 'Unfilled Gap'] = max(0, _gap_ - _na)
+        _zs.drop(columns=['_zk'], errors='ignore').to_csv(summary_path, index=False)
+    except Exception as _e:
+        print(f"[vetted] Warning: could not update zone summary unfilled gap ({_e})")
+
     # ── Write per-date output ──────────────────────────────────────────────────
     OUT_COLS = [
         'ID', 'DATE', 'sourcezone', 'USERNAME', 'NUMBER_OF_MEN', 'RES_TYPE',
         'consider_res_type', 'rating', 'deallo_pct', 'VAT_STATUS',
         'RESERVATION_CAPACITY', 'new_recommendation_rank',
-        'vetting_status', 'vetting_reason',
+        'vetting_status', 'vetting_reason', 'rating_fallback',
     ]
 
     recs = recs.sort_values(['DATE', 'sourcezone', 'new_recommendation_rank'])
     out_cols = [c for c in OUT_COLS if c in recs.columns]
 
-    script_dir = __import__('os').path.dirname(__import__('os').path.abspath(output_path))
-
     for pickup_date, group in recs.groupby(recs['DATE'].dt.date):
-        csv_path = __import__('os').path.join(script_dir, f'vetted_tps_{pickup_date}.csv')
+        csv_path = os.path.join(OUTPUT_DIR, f'vetted_tps_{pickup_date}.csv')
         group[out_cols].to_csv(csv_path, index=False)
 
         n_accept  = int((group['vetting_status'] == 'ACCEPT').sum())
