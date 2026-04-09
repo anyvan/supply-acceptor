@@ -635,12 +635,11 @@ def run(demand_path: str, res_path: str, output_path: str = None,
                             ((res['IRES_STATUS'] == 'accepted') | (res['new_recommendation'] == True))
                         ]['USERNAME'].str.strip()
                     )
-                    south_quota_pct = LONDON_SOUTH_QUOTA_PCT if zone == 'london' else 0.0
                     fallback_selected = select_v2(
                         fallback_candidates, rem_gap_1m, rem_gap_2m,
                         accepted_usernames,
                         float(zd.get('jobs_1m', 0)),
-                        south_quota_pct=south_quota_pct,
+                        south_quota_pct=0.0,  # no south quota in fallback pass
                     )
                     start_rank = len(to_accept) + 1
                     for rank, idx in enumerate(fallback_selected.index, start=start_rank):
