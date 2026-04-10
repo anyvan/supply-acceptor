@@ -754,6 +754,27 @@ def write_vetted_recommendations_csv(output_path: str):
                             f"deallo={round(float(best.get('Deallo Rate Overall', 0))*100, 1)}%)"
                         )
                         active_usernames.add(best['USERNAME'])
+                        # Add replacement TP as a separate ACCEPT row so user can filter on ACCEPT status
+                        repl_row = {
+                            'ID': best['ID'],
+                            'DATE': excess_row['DATE'],
+                            'sourcezone': zone,
+                            'USERNAME': best['USERNAME'],
+                            'NUMBER_OF_MEN': int(best['NUMBER_OF_MEN']),
+                            'RES_TYPE': best['RES_TYPE'],
+                            'consider_res_type': best.get('consider_res_type', best['RES_TYPE']),
+                            'rating': best['rating'],
+                            'deallo_pct': round(float(best.get('Deallo Rate Overall', 0)) * 100, 1),
+                            'VAT_STATUS': best.get('VAT_STATUS', 0),
+                            'RESERVATION_CAPACITY': best.get('RESERVATION_CAPACITY', None),
+                            'new_recommendation_rank': excess_row['new_recommendation_rank'],
+                            'vetting_status': 'ACCEPT',
+                            'vetting_reason': f"Dedup replacement for {username}",
+                            'rating_fallback': False,
+                            '_score': best.get('_score', 0),
+                            '_is_new_tp': bool(best.get('_is_new_tp', False)),
+                        }
+                        recs = pd.concat([recs, pd.DataFrame([repl_row])], ignore_index=True)
                     else:
                         ei_eligible = zone in {'london', 'birmingham', 'manchester'}
                         recs.at[rec_idx, 'vetting_status'] = 'REMOVE_DEDUP'
