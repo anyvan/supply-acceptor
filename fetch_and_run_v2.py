@@ -29,6 +29,7 @@ from datetime import date, timedelta, datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, 'legacy'))
 
 # ── Shared data-fetching helpers from V1 (not duplicated) ─────────────────────
 from fetch_and_run import (

@@ -466,7 +466,10 @@ def write_vetted_recommendations_csv(output_path: str):
         Any TP that appears more than once (accepted + newly recommended) on the
         same day gets one slot removed.  Where a same-men replacement exists in
         pending it gets vetting_status = 'REPLACE_DEDUP'; where there is no
-        replacement the excess slot gets vetting_status = 'REMOVE_DEDUP'.
+        replacement but the zone still has an unfilled gap, the duplicate is kept
+        as ACCEPT (a TP can have multiple vehicles); where there is no replacement
+        and the zone gap is already covered, the excess slot gets vetting_status
+        = 'REMOVE_DEDUP'.
 
     Output columns:
         ID, DATE, sourcezone, USERNAME, NUMBER_OF_MEN, RES_TYPE, consider_res_type,
@@ -776,13 +779,35 @@ def write_vetted_recommendations_csv(output_path: str):
                         }
                         recs = pd.concat([recs, pd.DataFrame([repl_row])], ignore_index=True)
                     else:
-                        ei_eligible = zone in {'london', 'birmingham', 'manchester'}
-                        recs.at[rec_idx, 'vetting_status'] = 'REMOVE_DEDUP'
-                        recs.at[rec_idx, 'vetting_reason']  = (
-                            f"Dedup: {username} already accepted/recommended; "
-                            f"no {excess_men}-man replacement in pending pool. "
-                            + ("Leave for EI." if ei_eligible else "Do not accept duplicate.")
-                        )
+                        # No replacement found — check if zone still has an unfilled gap.
+                        # A TP can have multiple vehicles, so keeping a duplicate is valid
+                        # supply when the pool is exhausted and slots remain unfilled.
+                        zone_gap_rows = day_summary[
+                            day_summary['_zone_key'].str.strip().str.lower() == zone.strip().lower()
+                        ]
+                        zone_gap = int(zone_gap_rows['Gap'].iloc[0]) if len(zone_gap_rows) > 0 else 0
+                        zone_accept_count = recs[
+                            (recs['sourcezone'] == zone) &
+                            (recs['DATE'].dt.date == pickup_date_ts) &
+                            (recs['vetting_status'] == 'ACCEPT') &
+                            (recs.index != rec_idx)
+                        ].shape[0]
+
+                        if zone_accept_count < zone_gap:
+                            # Zone still has unfilled slots — keep the duplicate
+                            recs.at[rec_idx, 'vetting_status'] = 'ACCEPT'
+                            recs.at[rec_idx, 'vetting_reason'] = (
+                                f"Dedup: {username} already accepted/recommended; "
+                                f"no {excess_men}-man replacement — kept duplicate to fill shortfall"
+                            )
+                        else:
+                            ei_eligible = zone in {'london', 'birmingham', 'manchester'}
+                            recs.at[rec_idx, 'vetting_status'] = 'REMOVE_DEDUP'
+                            recs.at[rec_idx, 'vetting_reason'] = (
+                                f"Dedup: {username} already accepted/recommended; "
+                                f"no {excess_men}-man replacement in pending pool. "
+                                + ("Leave for EI." if ei_eligible else "Do not accept duplicate.")
+                            )
 
 
     # ── Update zone summary: Unfilled Gap and EI Hold counts (post-quota) ────────

@@ -49,6 +49,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # score_tp, diversified_sample, select_candidates, london_* are unchanged.
 # We import them rather than duplicating.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'legacy'))
 from supply_acceptor import (
     score_tp, versatility_rank, diversified_sample, select_candidates,
     is_south_london, london_select_candidates, london_calc_target,
