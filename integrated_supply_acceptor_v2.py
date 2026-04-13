@@ -525,10 +525,6 @@ def write_vetted_recommendations_csv(output_path: str):
 
         ei_lo = 20 if pickup_date.day_name() == 'Sunday' else 25
 
-        # Current EI (with ALL new recs accepted)
-        total_acc_with_all = already_acc + total_new_recs
-        ei_current = total_jobs / ei_jpj - total_acc_with_all
-
         # ── Layer 0.5: Zone EI reservation quotas ─────────────────────────────
         # Hold back TPs for EI only to the extent needed to guarantee the quota.
         # If the primary pass already left slots free (pool couldn't fill the gap),
@@ -570,6 +566,14 @@ def write_vetted_recommendations_csv(output_path: str):
                 )
 
         # ── Layer 1: EI balancing — proportional hold across deep-pool zones ─
+        # Recompute ei_current AFTER Layer 0.5 so quota holds are already
+        # reflected — avoids over-counting needed holds.
+        post_quota_accept = sum(
+            1 for i in day_recs_idx
+            if recs.at[i, 'vetting_status'] == 'ACCEPT'
+        )
+        ei_current = total_jobs / ei_jpj - (already_acc + post_quota_accept)
+
         if ei_current < ei_lo:
             import math
 
