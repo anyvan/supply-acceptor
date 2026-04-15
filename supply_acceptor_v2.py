@@ -759,8 +759,11 @@ def run(demand_path: str, res_path: str, output_path: str = None,
             day_2m  = int(grp['Furn2M Jobs'].sum())
             day_rem = int(grp['Rem Jobs'].sum())
             day_tot = int(grp['Total Jobs'].sum())
-            day_new = int(grp['Newly Accepted'].sum())
-            day_acc = int(grp['Accepted'].sum()) + day_new
+            day_new     = int(grp['Newly Accepted'].sum())
+            day_ei_hold = int(grp['EI Hold'].sum()) if 'EI Hold' in grp.columns else 0
+            day_acc     = int(grp['Accepted'].sum()) + day_new
+            # For EI journey calc: exclude HOLD_EI TPs — they are supply for EI, not pre-accepted
+            day_acc_accept = day_acc - day_ei_hold
             tot_row = ['TOTAL', day_1m, day_2m, day_rem]
             if show_conf:
                 tot_row += [int(grp['Conf1M'].sum()), int(grp['Conf2M'].sum()),
@@ -795,7 +798,7 @@ def run(demand_path: str, res_path: str, output_path: str = None,
 
             # ── EI Vetting — dynamic JPJ ───────────────────────────────────
             ei_jpj    = predicted_ei_jpj(day_1m, day_2m, day_rem, date)
-            ei_jrnys  = day_tot / ei_jpj - day_acc
+            ei_jrnys  = day_tot / ei_jpj - day_acc_accept
             dow       = pd.Timestamp(date).day_name()
             ei_lo, ei_hi = (20, 30) if dow == 'Sunday' else (25, 40)
 
@@ -808,7 +811,7 @@ def run(demand_path: str, res_path: str, output_path: str = None,
 
             print(f"\n  EI Vetting ({dow}): {day_tot} jobs ÷ {ei_jpj:.2f} (v2 predicted JPJ) "
                   f"= {day_tot/ei_jpj:.1f} expected journeys  |  "
-                  f"Post-acceptance TPs: {day_acc}  |  "
+                  f"Pre-accepted TPs: {day_acc_accept} (excl. {day_ei_hold} HOLD_EI)  |  "
                   f"→ Journeys to EI: {ei_jrnys:.1f}  {ei_status}")
             print(f"  [v1 comparison] {day_tot} ÷ 5.5 = {day_tot/5.5:.1f} journeys to EI using fixed JPJ")
 
