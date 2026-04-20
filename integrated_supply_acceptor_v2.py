@@ -52,6 +52,7 @@ UK_TZ        = ZoneInfo('Europe/London')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, 'legacy'))
 
 # ── S3 forecast config (same bucket as V1) ─────────────────────────────────────
 FORECAST_S3_BUCKET = 'supply-acceptor-data-production'
@@ -447,6 +448,17 @@ def write_vetted_recommendations_csv(output_path: str):
     Produces a second per-date CSV — vetted_tps_YYYY-MM-DD.csv — that applies
     two layers of corrections on top of the raw recommendations:
 
+    Layer 0 — Coverage sufficiency:
+        For each zone, compute the expected job coverage from already-accepted TPs
+        using per-bucket JPJ parameters (jpj_1m for 1M/12M TPs, jpj_2m for 2M TPs).
+        If the residual demand (total_zone_jobs − coverage) is less than one
+        additional TP's worth of jobs (i.e. floor(residual / jpj_ovrl) == 0),
+        all new recommendations for that zone are marked REMOVE_COVERED.
+        If residual supports N additional TPs, only the top N (by rank) are kept;
+        lower-ranked recs beyond N are also marked REMOVE_COVERED.
+        This prevents accepting TPs that add no real new supply on top of what
+        already-accepted TPs (including return-type reservations) will cover.
+
     Layer 0.5 — Zone EI reservation quotas:
         Unconditionally hold back a fixed number of TPs from high-supply zones
         (configured in EI_RESERVATION_QUOTA) so EI always receives a baseline
@@ -480,6 +492,7 @@ def write_vetted_recommendations_csv(output_path: str):
     import supply_acceptor_v2 as sav2
 
     df = _load_output_csv(output_path)
+    jpj_params = sav2.load_jpj_params()
     df['_score']     = df.apply(sav2.score_tp, axis=1)
     df['_is_new_tp'] = df['rating'].apply(lambda r: float(r or 0) == 6.0)
     df['deallo_pct'] = (
@@ -524,6 +537,55 @@ def write_vetted_recommendations_csv(output_path: str):
         total_new_recs = len(day_recs_idx)
 
         ei_lo = 20 if pickup_date.day_name() == 'Sunday' else 25
+
+        # ── Layer 0: Coverage sufficiency ─────────────────────────────────────
+        # Check whether already-accepted TPs in each zone cover enough demand
+        # that new recommendations are not needed.
+        zones_in_day = recs.loc[day_recs_idx, 'sourcezone'].unique()
+        for zone in zones_in_day:
+            zone_accepted = day_all[
+                (day_all['sourcezone'] == zone) &
+                (day_all['IRES_STATUS'] == 'accepted')
+            ]
+
+            params   = jpj_params.get(zone, {})
+            _jpj_1m  = float(params.get('jpj_1m',  params.get('jpj_ovrl', 5.5)))
+            _jpj_2m  = float(params.get('jpj_2m',  params.get('jpj_ovrl', 5.5)))
+            _jpj_ovrl = float(params.get('jpj_ovrl', 5.5))
+
+            coverage = 0.0
+            for _, tp in zone_accepted.iterrows():
+                men = int(tp.get('NUMBER_OF_MEN', 1))
+                coverage += _jpj_2m if men == 2 else _jpj_1m
+
+            zsum = day_summary[day_summary['_zone_key'] == zone]
+            if zsum.empty:
+                continue
+            zone_jobs = int(zsum.iloc[0].get('Total Jobs', 0))
+            if zone_jobs == 0:
+                continue
+
+            residual = zone_jobs - coverage
+            _ratio   = residual / _jpj_ovrl if _jpj_ovrl > 0 else 0
+            # Round up if decimal >= 0.75 (TP genuinely needed), otherwise floor
+            import math as _math
+            additional_needed = max(0, _math.ceil(_ratio) if (_ratio % 1) >= 0.75 else _math.floor(_ratio))
+
+            zone_accept_idx = sorted(
+                [i for i in day_recs_idx
+                 if recs.at[i, 'sourcezone'] == zone
+                 and recs.at[i, 'vetting_status'] == 'ACCEPT'],
+                key=lambda i: recs.at[i, 'new_recommendation_rank']
+            )
+
+            for rank, idx in enumerate(zone_accept_idx):
+                if rank >= additional_needed:
+                    men = int(recs.at[idx, 'NUMBER_OF_MEN'])
+                    recs.at[idx, 'vetting_status'] = 'REMOVE_COVERED'
+                    recs.at[idx, 'vetting_reason'] = (
+                        f"Coverage sufficient: accepted TPs cover {coverage:.1f}/{zone_jobs} jobs "
+                        f"(residual={residual:.1f}, ratio={_ratio:.3f}, needs {additional_needed} more TPs)"
+                    )
 
         # ── Layer 0.5: Zone EI reservation quotas ─────────────────────────────
         # Hold back TPs for EI only to the extent needed to guarantee the quota.
@@ -854,14 +916,16 @@ def write_vetted_recommendations_csv(output_path: str):
         csv_path = os.path.join(OUTPUT_DIR, f'vetted_tps_{pickup_date}.csv')
         group[out_cols].to_csv(csv_path, index=False)
 
-        n_accept  = int((group['vetting_status'] == 'ACCEPT').sum())
-        n_hold    = int((group['vetting_status'] == 'HOLD_EI').sum())
-        n_replace = int((group['vetting_status'] == 'REPLACE_DEDUP').sum())
-        n_remove  = int((group['vetting_status'] == 'REMOVE_DEDUP').sum())
+        n_accept      = int((group['vetting_status'] == 'ACCEPT').sum())
+        n_hold        = int((group['vetting_status'] == 'HOLD_EI').sum())
+        n_replace     = int((group['vetting_status'] == 'REPLACE_DEDUP').sum())
+        n_remove      = int((group['vetting_status'] == 'REMOVE_DEDUP').sum())
+        n_rm_covered  = int((group['vetting_status'] == 'REMOVE_COVERED').sum())
         print(
             f"[vetted] {pickup_date}: "
             f"{n_accept} ACCEPT  {n_hold} HOLD_EI  "
             f"{n_replace} REPLACE_DEDUP  {n_remove} REMOVE_DEDUP  "
+            f"{n_rm_covered} REMOVE_COVERED  "
             f"→ {csv_path}"
         )
 

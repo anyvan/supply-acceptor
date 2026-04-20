@@ -148,7 +148,8 @@ def calc_zone_targets_v2(zone: str, furn_1m: float, furn_2m: float,
     jpj_2m   = p['jpj_2m']   * jpj_multiplier
     jpj_ovrl = p['jpj_ovrl'] * jpj_multiplier
 
-    target_1m = math.floor(eff_1m * p['pct_1m_1j'] / jpj_1m) if jpj_1m > 0 else 0
+    _ratio_1m = (eff_1m * p['pct_1m_1j'] / jpj_1m) if jpj_1m > 0 else 0
+    target_1m = math.ceil(_ratio_1m) if (_ratio_1m % 1) >= 0.8 else math.floor(_ratio_1m)
     # Jobs from the 1M->1J pathway not covered by accepted 1M TPs spill onto 2M vehicles
     residual_1m = max(0.0, eff_1m * p['pct_1m_1j'] - target_1m * jpj_1m)
     load_2m   = residual_1m + eff_1m * p['pct_1m_2j'] + eff_2m + eff_rem
@@ -367,7 +368,7 @@ def run(demand_path: str, res_path: str, output_path: str = None,
 
     # Add zones that have reservations but no demand
     pickup_dates = zone_day['pickup_day'].unique()
-    res_zones    = set(res[res['DATE'].isin(pickup_dates)]['sourcezone'].unique())
+    res_zones    = set(z for z in res[res['DATE'].isin(pickup_dates)]['sourcezone'].unique() if isinstance(z, str))
     demand_pairs = set(zip(zone_day['sourcezone'], zone_day['pickup_day']))
     extra_base = {'jobs_1m': 0, 'jobs_2m': 0, 'jobs_rem': 0, 'realized_jobs': 0, 'one_man_ratio': 0}
     if has_confirmed:
@@ -526,6 +527,8 @@ def run(demand_path: str, res_path: str, output_path: str = None,
 
     for _, zd in zone_day.iterrows():
         zone   = zd['sourcezone']
+        if not isinstance(zone, str):
+            continue
         date   = zd['pickup_day']
         gap    = int(zd['gap'])
         gap_1m = int(zd['gap_1m'])
