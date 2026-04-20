@@ -183,17 +183,12 @@ def fetch_tp_quality(conn) -> pd.DataFrame:
             u.NICKNAME,
             l.category_id,
             COUNT(DISTINCT lp.LISTING_ID) AS assigned_listings,
-            COUNT(lp.DE_ALLOCATE_REASON_IDENTIFIER) AS all_deallocations,
-            COUNT(IFF((DATE(lp.DE_ALLOCATED_AT) = DATE(l.PICKUP_DATE))
-                    AND (lp.DE_ALLOCATE_REASON_IDENTIFIER ILIKE '%charged%'),
-                    lp.DE_ALLOCATED_AT, NULL)) AS same_day_charged_deallo,
-            all_deallocations / assigned_listings AS deallo_rate,
-            same_day_charged_deallo / assigned_listings AS same_day_charged_deallo_rate
+            COUNT(lp.DE_ALLOCATE_REASON_IDENTIFIER) AS all_deallo_count
         FROM harmonised.production.listing l
         LEFT JOIN harmonised.production.listing_provider lp ON l.listing_id = lp.listing_id
         LEFT JOIN harmonised.production.USER u ON lp.PROVIDER_ID = u.USER_ID
         LEFT JOIN harmonised.staging.category ct ON l.category_id = ct.category_id
-        WHERE l.PICKUP_DATE > DATEADD(MONTH, -2, CURRENT_DATE())
+        WHERE l.PICKUP_DATE > DATEADD(MONTH, -3, CURRENT_DATE())
           AND l.locale IN ('en-gb','es-es','fr-fr')
           AND l.classification = 'instant-price'
           AND l.PICKUP_DATE <= CURRENT_DATE() - 1
@@ -211,7 +206,8 @@ def fetch_tp_quality(conn) -> pd.DataFrame:
             tp.nickname AS driver_nickname,
             l.category_id,
             AVG((lf.PROVIDER_CARE_OF_GOODS + lf.PROVIDER_COMMUNICATION
-                 + lf.PROVIDER_PRESENTATION + lf.PROVIDER_PUNCTUALITY) / 4) AS TP_RATING
+                 + lf.PROVIDER_PRESENTATION + lf.PROVIDER_PUNCTUALITY) / 4) AS TP_RATING,
+            COUNT(DISTINCT l.listing_id) AS jobs_completed
         FROM harmonised.production.listing_feedback lf
         JOIN harmonised.production.listing l ON l.listing_id = lf.listing_id
         LEFT JOIN harmonised.production.user tp ON tp.user_id = l.chosen_provider AND tp.role = 2
@@ -219,7 +215,7 @@ def fetch_tp_quality(conn) -> pd.DataFrame:
           AND l.locale IN ('en-gb','es-es','fr-fr')
           AND l.classification = 'instant-price'
           AND l.feedback_score IS NOT NULL
-          AND l.pickup_date > DATEADD(MONTH, -2, CURRENT_DATE())
+          AND l.pickup_date > DATEADD(MONTH, -3, CURRENT_DATE())
           AND l.pickup_date <= CURRENT_DATE() - 1
           AND l.status <> 24
           AND l.category_id IN (1)
@@ -235,35 +231,60 @@ def fetch_tp_quality(conn) -> pd.DataFrame:
         WHERE u.role = 2
     )
     SELECT
-        COALESCE(dl.NICKNAME, stats.driver_nickname) AS TP_USERNAME,
-        dl.same_day_charged_deallo_rate AS DEALLO_RATE,
-        dl.deallo_rate                  AS DEALLO_RATE_OVERALL,
+        COALESCE(dl.NICKNAME, stats.driver_nickname)    AS TP_USERNAME,
+        COALESCE(dl.assigned_listings, 0)               AS ASSIGNED_LISTINGS,
+        COALESCE(dl.all_deallo_count, 0)                AS ALL_DEALLO_COUNT,
         stats.TP_RATING,
-        vi.vat_status                   AS VAT_STATUS
+        COALESCE(stats.jobs_completed, 0)               AS JOBS_COMPLETED,
+        vi.vat_status                                   AS VAT_STATUS
     FROM dl
     FULL OUTER JOIN stats ON dl.PROVIDER_ID = stats.user_id AND dl.category_id = stats.category_id
     LEFT JOIN vat_info vi ON vi.nickname = COALESCE(dl.NICKNAME, stats.driver_nickname)
     WHERE COALESCE(dl.PROVIDER_ID, stats.user_id) IS NOT NULL
     """
-    print("  Fetching TP quality...")
+    print("  Fetching TP quality (3-month window, overall deallo, Bayesian shrinkage)...")
     df = sf_query(conn, sql)
-    df = df.rename(columns={
-        'TP_RATING': 'rating',
-        'DEALLO_RATE': 'Deallo Rate',
-        'DEALLO_RATE_OVERALL': 'Deallo Rate Overall',
-    })
-    for col in ['rating', 'Deallo Rate', 'Deallo Rate Overall']:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+    for col in ['ASSIGNED_LISTINGS', 'ALL_DEALLO_COUNT', 'JOBS_COMPLETED']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df['TP_RATING'] = pd.to_numeric(df['TP_RATING'], errors='coerce')
     df['VAT_STATUS'] = pd.to_numeric(df['VAT_STATUS'], errors='coerce').fillna(0).astype(int)
+
+    # Aggregate across category rows before computing rates
+    df['TP_USERNAME'] = df['TP_USERNAME'].str.upper().str.strip()
     df = df.groupby('TP_USERNAME', as_index=False).agg({
-        'rating': 'mean',
-        'Deallo Rate': 'mean',
-        'Deallo Rate Overall': 'mean',
+        'ASSIGNED_LISTINGS': 'sum',
+        'ALL_DEALLO_COUNT': 'sum',
+        'JOBS_COMPLETED': 'sum',
+        'TP_RATING': 'mean',
         'VAT_STATUS': 'max',
     })
-    df['TP_USERNAME'] = df['TP_USERNAME'].str.upper().str.strip()
+
+    # Overall deallo rate (all deallocations / assigned listings)
+    df['overall_deallo_rate'] = (
+        df['ALL_DEALLO_COUNT'] / df['ASSIGNED_LISTINGS'].replace(0, pd.NA)
+    ).fillna(0.0)
+
+    # Bayesian shrinkage — deallo (k=10, n=assigned_listings)
+    pop_avg_deallo = df['overall_deallo_rate'].mean() if len(df) > 0 else 0.05
+    n_d = df['ASSIGNED_LISTINGS'].fillna(0)
+    w_d = n_d / (n_d + 10)
+    df['overall_deallo_rate'] = (w_d * df['overall_deallo_rate'] + (1 - w_d) * pop_avg_deallo).round(4)
+
+    # Bayesian shrinkage — rating (k=10, n=jobs_completed)
+    pop_avg_rating = df['TP_RATING'].dropna().mean() if df['TP_RATING'].notna().any() else 6.0
+    n_r = df['JOBS_COMPLETED'].fillna(0)
+    w_r = n_r / (n_r + 10)
+    df['TP_RATING'] = (w_r * df['TP_RATING'].fillna(pop_avg_rating) + (1 - w_r) * pop_avg_rating).round(4)
+
+    df.rename(columns={'TP_RATING': 'rating', 'overall_deallo_rate': 'Deallo Rate Overall'}, inplace=True)
+    df['Deallo Rate'] = df['Deallo Rate Overall']  # backward-compat alias
+    df['rating'] = df['rating'].fillna(6.0)
+    df['Deallo Rate Overall'] = df['Deallo Rate Overall'].fillna(0.05)
+    df['Deallo Rate'] = df['Deallo Rate'].fillna(0.05)
+
     print(f"  TP quality: {len(df)} TPs loaded")
-    return df
+    return df[['TP_USERNAME', 'rating', 'Deallo Rate', 'Deallo Rate Overall', 'VAT_STATUS']]
 
 # ── Reservations ──────────────────────────────────────────────────────────────
 def fetch_reservations(dates: list, conn, tp_quality: pd.DataFrame) -> pd.DataFrame:
@@ -319,13 +340,13 @@ def fetch_reservations(dates: list, conn, tp_quality: pd.DataFrame) -> pd.DataFr
             left_on='USERNAME', right_on='TP_USERNAME', how='left'
         ).drop(columns='TP_USERNAME', errors='ignore')
         df['rating']              = df['rating'].fillna(6.0)
-        df['Deallo Rate']         = df['Deallo Rate'].fillna(0.0)
-        df['Deallo Rate Overall'] = df['Deallo Rate Overall'].fillna(0.0)
+        df['Deallo Rate']         = df['Deallo Rate'].fillna(0.05)
+        df['Deallo Rate Overall'] = df['Deallo Rate Overall'].fillna(0.05)
         df['VAT_STATUS']          = df['VAT_STATUS'].fillna(0).astype(int)
     else:
         df['rating'] = 6.0
-        df['Deallo Rate'] = 0.0
-        df['Deallo Rate Overall'] = 0.0
+        df['Deallo Rate'] = 0.05
+        df['Deallo Rate Overall'] = 0.05
         df['VAT_STATUS'] = 0
 
     df.drop(columns=['start_key', '_city', 'START_LAT', 'START_LNG', 'TYPE'], inplace=True, errors='ignore')

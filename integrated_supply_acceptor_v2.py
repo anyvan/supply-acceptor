@@ -1147,7 +1147,7 @@ def print_vetted_report(output_path: str, is_forecast: bool = False):
         for zone in all_zones:
             zv = vetted[vetted['sourcezone'] == zone]
             # If any HOLD_EI reason mentions 'already accepted' it was caught by dedup; just note it
-            dup_held = zv[zv['vetting_reason'].str.contains('already accepted', na=False, case=False) & (zv['vetting_status'] == 'HOLD_EI')]
+            dup_held = zv[zv['vetting_reason'].astype(str).str.contains('already accepted', na=False, case=False) & (zv['vetting_status'] == 'HOLD_EI')]
             if not dup_held.empty:
                 for _, r in dup_held.iterrows():
                     flags_list.append((flag_n, f"{zone}: {r['USERNAME']} has multiple accepted reservations — ops awareness only"))
