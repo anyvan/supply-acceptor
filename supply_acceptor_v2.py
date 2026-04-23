@@ -68,12 +68,12 @@ JPJ_PARAMS_FILE   = os.path.join(BASE_DIR, 'jpj_parameters.csv')
 DEMAND_FILE       = os.path.join(BASE_DIR, 'FURN_Supply_Summary - Detailed view (2).csv')
 RES_FILE          = os.path.join(BASE_DIR, 'FURN_Supply_Summary - reservations (10).csv')
 
-# ── EI JPJ linear model coefficients (fitted on 30-day all-vehicle data) ──────
-EI_JPJ_B0           = 5.2435
-EI_JPJ_B1           = 0.0023    # per 1M-req job
-EI_JPJ_B2           = -0.0007   # per 2M-req job
-EI_JPJ_B3           = -0.0171   # per removal job
-EI_JPJ_SUNDAY_DELTA = 0.4149    # Sunday intercept uplift
+# ── EI JPJ linear model coefficients (fitted on 72-day all-vehicle data, D+1 corrected) ──
+EI_JPJ_B0           = 5.5361
+EI_JPJ_B1           = 0.0024    # per 1M-req job
+EI_JPJ_B2           = -0.0011   # per 2M-req job
+EI_JPJ_B3           = -0.0207   # per removal job
+EI_JPJ_SUNDAY_DELTA = -0.3336   # Sunday intercept delta (negative after D+1 correction)
 
 # ── Minimum 1-man jobs before accepting a 1-man TP (unchanged from v1) ────────
 MIN_1MAN_JOBS_FOR_1MAN_TP = 9
@@ -179,7 +179,7 @@ def predicted_ei_jpj(furn_1m: float, furn_2m: float, rem: float,
            + EI_JPJ_B2 * furn_2m
            + EI_JPJ_B3 * rem
            + (EI_JPJ_SUNDAY_DELTA if is_sunday else 0.0))
-    return max(4.0, jpj)   # floor at 4.0 to avoid unrealistic values
+    return max(4.3, jpj)   # floor at 4.3 to avoid unrealistic values
 
 
 # ── Effective target for forecast-mode conservative acceptance ────────────────

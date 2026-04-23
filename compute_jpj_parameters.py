@@ -34,7 +34,7 @@ S3_PREFIX  = 'journey_building/GB/'
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR  = os.path.join(SCRIPT_DIR, '..')
-CLUSTERS_CSV = os.path.join(PARENT_DIR, 'centers for cluster info - Final_clusters.csv')
+CLUSTERS_CSV = os.path.join(SCRIPT_DIR, 'centers for cluster info - Final_clusters.csv')
 
 UK_LAT_MIN, UK_LAT_MAX = 49.809432, 58.700162
 UK_LNG_MIN, UK_LNG_MAX = -7.092700,  2.133975
@@ -433,7 +433,7 @@ def main():
             continue
 
         day_rows.append({
-            'date':            d,
+            'date':            d + timedelta(days=1),  # run date D routes pickup date D+1
             'x_1m':           int((furn['_men_req'] == 1).sum()),
             'y_2m':           int((furn['_men_req'] == 2).sum()),
             'z_rem':          len(rem),
@@ -495,6 +495,76 @@ def main():
               f"{int(row['x_1m']):>7} {int(row['y_2m']):>7} {int(row['z_rem']):>5} "
               f"{row['actual_jpj']:>11.2f} {row['pred_jpj']:>9.2f} {diff_s:>7}")
     print(f"{'─'*85}")
+
+    # ── Model J: Decomposed journeys (furniture + removals) ───────────────────
+    # Assumption: each removal job ≈ 1 journey (C = 1.0)
+    # Fit J_furn = β0 + β1·1M + β2·2M + β4·Sunday where J_furn = total_journeys - rem
+    # At prediction: JPJ = max((1M+2M+rem) / (J_furn_pred + rem/C), 4.3)
+    JPJ_FLOOR   = 4.3
+    C_REM       = 1.0   # removal journeys per removal job
+
+    J_total = day_df['total_journeys'].values
+    J_furn_actual = J_total - day_df['z_rem'].values / C_REM
+
+    X_j = np.column_stack([
+        np.ones(len(day_df)),
+        day_df['x_1m'].values,
+        day_df['y_2m'].values,
+        is_sunday,
+    ])
+    Xw_j = X_j * W[:, None]
+    yw_j = J_furn_actual * W
+    coeffs_j, _, _, _ = np.linalg.lstsq(Xw_j, yw_j, rcond=None)
+    jb0, jb1, jb2, jb4 = coeffs_j
+
+    J_furn_pred = X_j @ coeffs_j
+    J_rem_pred  = day_df['z_rem'].values / C_REM
+    total_jobs  = day_df['total_jobs'].values
+    jpj_j_raw   = total_jobs / (J_furn_pred + J_rem_pred)
+    jpj_j       = np.maximum(jpj_j_raw, JPJ_FLOOR)
+
+    # R² on the raw (pre-floor) JPJ prediction vs actual JPJ
+    ss_res_j = np.sum(W * (y_jpj - jpj_j_raw) ** 2)
+    r2_j     = 1 - ss_res_j / ss_tot if ss_tot > 0 else float('nan')
+
+    mae_a = np.average(np.abs(y_jpj - y_pred), weights=W)
+    mae_j = np.average(np.abs(y_jpj - jpj_j),  weights=W)
+    bias_a = np.average(y_pred - y_jpj, weights=W)
+    bias_j = np.average(jpj_j  - y_jpj, weights=W)
+
+    print(f"\n{'─'*65}")
+    print(f"Model J — Decomposed (furniture journeys + removal journeys)")
+    print(f"  Assumption: each removal job = {C_REM:.1f} journey(s), JPJ floor = {JPJ_FLOOR}")
+    print(f"  J_furn = β0 + β1·(1M) + β2·(2M) + β4·Sunday")
+    print(f"  β0 (intercept)    = {jb0:+.4f}")
+    print(f"  β1 (1M jobs)      = {jb1:+.4f}")
+    print(f"  β2 (2M jobs)      = {jb2:+.4f}")
+    print(f"  β4 (Sunday dummy) = {jb4:+.4f}")
+    print(f"  R² (pre-floor)    = {r2_j:.4f}")
+    print(f"\n  Prediction: JPJ = max( (1M+2M+rem) / (J_furn_pred + rem/{C_REM:.1f}), {JPJ_FLOOR} )")
+    print(f"\n{'─'*65}")
+    print(f"{'':30s} {'Model A':>10} {'Model J':>10}")
+    print(f"{'─'*65}")
+    print(f"  {'R²':<28} {r2:>10.4f} {r2_j:>10.4f}")
+    print(f"  {'Weighted MAE':<28} {mae_a:>10.4f} {mae_j:>10.4f}")
+    print(f"  {'Weighted Bias':<28} {bias_a:>10.4f} {bias_j:>10.4f}")
+    print(f"{'─'*65}")
+
+    # Per-day comparison
+    day_df['pred_jpj_j'] = jpj_j
+    day_df['diff_j']     = jpj_j - day_df['actual_jpj']
+    day_df['floor_hit']  = (jpj_j_raw < JPJ_FLOOR)
+
+    print(f"\n{'─'*100}")
+    print(f"{'Date':<12} {'Day':<5} {'Rem':>5} {'Actual JPJ':>11} "
+          f"{'Model A':>9} {'Diff A':>7} {'Model J':>9} {'Diff J':>7} {'Floor?':>7}")
+    print(f"{'─'*100}")
+    for _, row in day_df.iterrows():
+        floor_s = '⚠' if row['floor_hit'] else ''
+        print(f"  {str(row['date']):<10} {row['weekday']:<5} {int(row['z_rem']):>5} "
+              f"{row['actual_jpj']:>11.2f} {row['pred_jpj']:>9.2f} {row['diff']:>+7.2f} "
+              f"{row['pred_jpj_j']:>9.2f} {row['diff_j']:>+7.2f} {floor_s:>7}")
+    print(f"{'─'*100}")
 
     # ── Step 8: Save CSV ───────────────────────────────────────────────────────
     out_df   = pd.DataFrame(rows)
